@@ -1,0 +1,7 @@
+# This machine's defaults for arun. Copy to arun.conf (not tracked) beside arun and edit.
+# A run's run.conf overrides each of them.
+
+HOST=workbox               # ssh host of the remote machine, as named in ~/.ssh/config
+LOCAL_REPO=~/src/myproject # the checkout arun copies when run.conf names none
+TEMPLATE=generic           # arun new <run> starts from templates/<TEMPLATE>/ (simple, generic, ...)
+#SYNC_INTERVAL=600         # seconds between mirror refreshes (arun mirror install)

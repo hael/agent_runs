@@ -1,0 +1,6 @@
+# Per-machine state. Only the framework is tracked.
+/arun.conf
+/runs/
+/var/
+__pycache__/
+.DS_Store

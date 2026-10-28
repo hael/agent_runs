@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# arun: autonomous Claude Code runs on a remote machine, driven from this machine.
+# See README.md next to this file. Usage: arun help
+set -euo pipefail
+
+AR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE="$AR/engine"
+RUNS="$AR/runs"
+TEMPLATES="$AR/templates"
+VAR="$AR/var"
+SSH_OPTS=(-o ConnectTimeout=20)
+SPEC_FILES=(run.conf prompt.md phases.md rulings.md)
+
+# this machine's defaults (arun.conf, not tracked); a run's run.conf overrides them
+HOST=; LOCAL_REPO=; TEMPLATE=generic
+# shellcheck source=/dev/null
+[ -f "$AR/arun.conf" ] && . "$AR/arun.conf"
+DEFAULT_HOST="$HOST"; DEFAULT_LOCAL_REPO="$LOCAL_REPO"
+
+usage() {
+    cat <<'EOF'
+arun: autonomous Claude Code runs on a remote machine, driven from this machine
+
+  arun new <run> [template]  create runs/<run>/ from templates/<template>/ (then edit its four files)
+  arun launch <run>          copy the checkout and the run to the remote machine, check it, start
+  arun resume <run> [phase]  after a stop or a new ruling: update the remote run, start again
+  arun rulings <run>         send runs/<run>/rulings.md now, also while the run runs (read at each phase start)
+  arun stop <run>            stop the driver, its Claude session and their jobs
+  arun status [<run>]        live state over ssh (without <run>: every run, from the mirror)
+  arun watch <run> [lines]   follow the current session live (Ctrl-C to stop watching)
+  arun fetch <run>           copy the review diffs and the reports to runs/<run>/result/
+  arun sync [<run>...]       refresh runs/<run>/live/, the mirror Claude reads (all runs by default)
+  arun mirror install        refresh the mirror every 10 minutes (LaunchAgent); also: uninstall, status
+  arun list                  every run with its last mirrored state
+EOF
+}
+
+die() { echo "arun: $*" >&2; exit 1; }
+
+load() {
+    RUN="${1:?run name}"
+    RDIR="$RUNS/$RUN"
+    [ -f "$RDIR/run.conf" ] || die "no run '$RUN' (expected $RDIR/run.conf)"
+    HOST="$DEFAULT_HOST"; LOCAL_REPO="$DEFAULT_LOCAL_REPO"; REMOTE_ROOT="agent_runs/$RUN"
+    # shellcheck source=/dev/null
+    . "$RDIR/run.conf"
+    [ -n "$HOST" ] || die "no HOST in arun.conf or runs/$RUN/run.conf"
+    LOCAL_REPO="${LOCAL_REPO/#\~/$HOME}"
+}
+
+# remote <command> [args]: engine/remote.sh on the remote machine, for this run
+remote() {
+    ssh "${SSH_OPTS[@]}" "$HOST" "bash -s -- '$REMOTE_ROOT' $*" < "$ENGINE/remote.sh"
+}
+
+copy_to() {
+    # copy_to <local dir>/ <remote dir>/ [rsync options...]
+    local src="$1" dst="$2"; shift 2
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "$@" "$src" "$HOST:$dst"
+}
+
+push() {
+    # the engine and the run's spec (prompt, phase notes, rulings) to the remote run
+    ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p '$REMOTE_ROOT/engine' '$REMOTE_ROOT/spec'"
+    copy_to "$ENGINE/" "$REMOTE_ROOT/engine/" --delete --exclude '.DS_Store' --exclude '__pycache__'
+    local tmp; tmp="$(mktemp -d)"
+    for f in "${SPEC_FILES[@]}"; do
+        [ -f "$RDIR/$f" ] || die "runs/$RUN/$f is missing"
+        cp "$RDIR/$f" "$tmp/$f"
+    done
+    printf '\n# added by arun\nRUN=%s\n' "$RUN" >> "$tmp/run.conf"
+    copy_to "$tmp/" "$REMOTE_ROOT/spec/"
+    rm -rf "$tmp"
+}
+
+copy_repo() {
+    # tracked files as they are in the working tree, and .git; no build trees, no untracked files
+    [ -n "$LOCAL_REPO" ] || die "no LOCAL_REPO in arun.conf or runs/$RUN/run.conf"
+    [ -d "$LOCAL_REPO/.git" ] || die "no git checkout at $LOCAL_REPO (LOCAL_REPO in arun.conf or runs/$RUN/run.conf)"
+    local untracked; untracked="$(mktemp)"
+    git -C "$LOCAL_REPO" --no-optional-locks ls-files --others --exclude-standard | sed 's#^#/#' > "$untracked"
+    echo ">>> copying $LOCAL_REPO to $HOST:~/$REMOTE_ROOT/repo"
+    if [ -s "$untracked" ]; then echo "    not copied (untracked):"; sed 's/^/      /' "$untracked"; fi
+    echo "    differences from HEAD that are copied (part of the reviewed diff):"
+    git -C "$LOCAL_REPO" --no-optional-locks status --porcelain --untracked-files=no | sed 's/^/      /'
+    # COPY_EXCLUDES of run.conf: rsync patterns left out of the copy (build trees and the like)
+    local -a pats=() ex=(); local p
+    read -r -a pats <<< "${COPY_EXCLUDES:-/build/ node_modules/}"
+    for p in "${pats[@]}"; do ex+=(--exclude "$p"); done
+    ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p '$REMOTE_ROOT/repo'"
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "${ex[@]}" --exclude '.DS_Store' \
+        --exclude-from="$untracked" "$LOCAL_REPO/" "$HOST:$REMOTE_ROOT/repo/"
+    rm -f "$untracked"
+}
+
+mirror_now() {
+    # refresh this run's mirror right away (and take it off the idle list)
+    rm -f "$RDIR/live/idle"
+    ( cmd_sync "$RUN" ) > /dev/null 2>&1 || true
+}
+
+session_view() {
+    ssh "${SSH_OPTS[@]}" "$HOST" "env ARUN_ROOT=\$HOME/$REMOTE_ROOT python3 - $*" < "$ENGINE/session_view.py"
+}
+
+cmd_new() {
+    local run="${1:?usage: arun new <run> [template]}" tpl="$TEMPLATES/${2:-$TEMPLATE}"
+    [ -d "$tpl" ] || die "no template $tpl (available: $(ls "$TEMPLATES" | tr '\n' ' '))"
+    [ -e "$RUNS/$run" ] && die "runs/$run exists already"
+    mkdir -p "$RUNS/$run"
+    for f in "${SPEC_FILES[@]}"; do
+        sed -e "s#@RUN@#$run#g" "$tpl/$f" > "$RUNS/$run/$f"
+    done
+    echo "created $RUNS/$run from $tpl: fill in run.conf, prompt.md and phases.md, then: arun launch $run"
+}
+
+cmd_launch() {
+    load "$1"
+    echo ">>> ssh $HOST"
+    ssh "${SSH_OPTS[@]}" "$HOST" true
+    if remote running; then die "the run is already running on $HOST"; fi
+    if ssh "${SSH_OPTS[@]}" "$HOST" "test -e '$REMOTE_ROOT/state/base_head'"; then
+        die "$HOST:~/$REMOTE_ROOT was launched before; continue it with: arun resume $RUN"
+    fi
+    if ssh "${SSH_OPTS[@]}" "$HOST" "test -d '$REMOTE_ROOT/repo/.git'"; then
+        echo ">>> $HOST:~/$REMOTE_ROOT/repo exists; keeping it (remove the run directory to start over)"
+    else
+        copy_repo
+    fi
+    echo ">>> engine and spec"
+    push
+    echo ">>> preflight on $HOST (a few minutes)"
+    ssh "${SSH_OPTS[@]}" "$HOST" "bash '$REMOTE_ROOT/engine/preflight.sh'"
+    echo ">>> starting"
+    remote start
+    mirror_now
+    echo ">>> running. Follow it with: arun watch $RUN"
+}
+
+cmd_resume() {
+    load "$1"
+    if remote running; then echo "the run is running on $HOST (arun status $RUN shows what); nothing to resume"; return; fi
+    echo ">>> engine and spec (with rulings.md)"
+    push
+    local phase="${2:-}"
+    [ -n "$phase" ] || phase="$(remote next)"
+    [ -n "$phase" ] || { echo "every phase is done; nothing to resume"; return; }
+    echo ">>> resuming phase $phase"
+    remote prepare-resume "$phase"
+    remote start
+    mirror_now
+    echo ">>> running. Follow it with: arun watch $RUN"
+}
+
+cmd_stop() { load "$1"; remote stop; mirror_now; }
+
+cmd_rulings() {
+    # only the rulings, safe while the run runs: sessions read them at the start of every
+    # phase and on resume
+    load "$1"
+    [ -f "$RDIR/rulings.md" ] || die "runs/$RUN/rulings.md is missing"
+    ssh "${SSH_OPTS[@]}" "$HOST" "cd '$REMOTE_ROOT' && mkdir -p spec && cat > spec/.rulings.tmp && mv spec/.rulings.tmp spec/rulings.md &&
+        echo 'sent to $HOST:~/$REMOTE_ROOT/spec/rulings.md'" < "$RDIR/rulings.md"
+    if remote running; then
+        echo "the run is running: the session reads them when the next phase starts (or on arun resume after a stop)"
+    else
+        echo "the run is not running: arun resume $RUN starts it with them"
+    fi
+}
+
+cmd_status() {
+    if [ -z "${1:-}" ]; then cmd_list; return; fi
+    load "$1"
+    remote status
+    echo
+    echo "== last actions of the session"
+    session_view --last 15
+}
+
+cmd_watch() { load "$1"; session_view --follow --last "${2:-40}"; }
+
+cmd_fetch() {
+    load "$1"
+    local out="$RDIR/result"
+    mkdir -p "$out"
+    copy_to_local() { rsync -a -e "ssh ${SSH_OPTS[*]}" "$HOST:$REMOTE_ROOT/$1" "$2" 2>/dev/null || true; }
+    copy_to_local review "$out/"
+    for f in RUN_STATUS.md state/base_head; do copy_to_local "$f" "$out/"; done
+    local report="${PLAN_DONE:-${PLAN:-doc/$RUN}}"; report="${report%.md}_report.md"
+    copy_to_local "repo/$report" "$out/"           # the review report the last phase writes
+    echo "result in $out"
+    ls -l "$out/review" 2>/dev/null | tail -n +2
+    [ -s "$out/base_head" ] && echo "the diffs apply to $(cat "$out/base_head"): git apply --check $out/review/full.diff"
+    return 0
+}
+
+sync_run() {
+    load "$1"
+    local live="$RDIR/live" err ok=1
+    err="$live/.sync_error.tmp"
+    mkdir -p "$live/remote"
+    : > "$err"
+    if remote status > "$live/status.txt.tmp" 2>> "$err"; then
+        mv "$live/status.txt.tmp" "$live/status.txt"
+        # nothing changes on the remote side until arun launches or resumes the run again
+        if grep -q '^driver: NOT running' "$live/status.txt" && ! grep -q '^left over:' "$live/status.txt"; then
+            touch "$live/idle"
+        else
+            rm -f "$live/idle"
+        fi
+        session_view --last 200 > "$live/session_tail.txt.tmp" 2>> "$err" &&
+            mv "$live/session_tail.txt.tmp" "$live/session_tail.txt"
+        rm -rf "$live/remote.tmp"; mkdir -p "$live/remote.tmp"
+        if remote files 2>> "$err" | tar -xf - -C "$live/remote.tmp" 2>> "$err"; then
+            [ -d "$live/remote/review" ] && mv "$live/remote/review" "$live/remote.tmp/review"
+            rm -rf "$live/remote"; mv "$live/remote.tmp" "$live/remote"
+        else
+            ok=0
+        fi
+        if ssh "${SSH_OPTS[@]}" "$HOST" "test -d '$REMOTE_ROOT/review'" 2>> "$err"; then
+            mkdir -p "$live/remote/review"
+            rsync -a --delete -e "ssh ${SSH_OPTS[*]}" "$HOST:$REMOTE_ROOT/review/" "$live/remote/review/" 2>> "$err" || ok=0
+        fi
+    else
+        ok=0
+    fi
+    rm -rf "$live"/*.tmp "$live/remote.tmp"
+    local now; now="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    if [ "$ok" = 1 ]; then
+        echo "$now OK ($HOST:~/$REMOTE_ROOT)" > "$live/synced_at.txt"
+        cp "$live/synced_at.txt" "$live/last_ok.txt"
+        rm -f "$live/sync_error.txt" "$err"
+        echo "$now $RUN: ok" >> "$VAR/sync.log"
+    else
+        echo "$now FAILED ($HOST:~/$REMOTE_ROOT); see sync_error.txt" > "$live/synced_at.txt"
+        grep -v -e 'post-quantum' -e 'store now, decrypt later' -e 'may need to be upgraded' "$err" \
+            > "$live/sync_error.txt" 2>/dev/null || true
+        rm -f "$err"
+        echo "$now $RUN: FAILED: $(tr '\n' ' ' < "$live/sync_error.txt" | cut -c1-300)" >> "$VAR/sync.log"
+    fi
+}
+
+cmd_sync() {
+    mkdir -p "$VAR"
+    if ! mkdir "$VAR/sync.lock" 2>/dev/null; then
+        # another sync is running, unless its lock is older than 30 minutes
+        [ -n "$(find "$VAR/sync.lock" -maxdepth 0 -mmin +30 2>/dev/null)" ] || return 0
+        rm -rf "$VAR/sync.lock"; mkdir "$VAR/sync.lock"
+    fi
+    trap 'rm -rf "$VAR/sync.lock"' EXIT
+    SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+    local runs=("$@") r
+    if [ ${#runs[@]} -eq 0 ]; then
+        # every run except the idle ones (driver ended, mirror already final)
+        for r in "$RUNS"/*/run.conf; do
+            [ -e "$r" ] && [ ! -e "$(dirname "$r")/live/idle" ] && runs+=("$(basename "$(dirname "$r")")")
+        done
+    fi
+    [ ${#runs[@]} -gt 0 ] || return 0
+    for r in "${runs[@]}"; do ( sync_run "$r" ) || true; done
+    if [ -f "$VAR/sync.log" ] && [ "$(wc -l < "$VAR/sync.log")" -gt 4000 ]; then
+        tail -n 2000 "$VAR/sync.log" > "$VAR/sync.log.tmp" && mv "$VAR/sync.log.tmp" "$VAR/sync.log"
+    fi
+}
+
+cmd_list() {
+    local r name
+    for r in "$RUNS"/*/run.conf; do
+        [ -e "$r" ] || { echo "no runs yet (arun new <run>)"; return; }
+        name="$(basename "$(dirname "$r")")"
+        local live="$RUNS/$name/live"
+        echo "== $name"
+        if [ -f "$live/status.txt" ]; then
+            echo "   mirrored $(cut -d' ' -f1-2 "$live/last_ok.txt" 2>/dev/null || echo never)$( [ -f "$live/sync_error.txt" ] && echo ', last sync FAILED')"
+            grep -E '^(driver|left over):' "$live/status.txt" | sed 's/^/   /'
+            [ -e "$live/idle" ] && echo "   (idle: the mirror polls it again after arun launch/resume)"
+            awk '/^== phases/ {f=1; next} /^$/ {f=0} f' "$live/status.txt" | grep -v ' pending$' | sed 's/^/   /'
+        else
+            echo "   no mirror yet (arun sync $name)"
+        fi
+    done
+}
+
+cmd_mirror() {
+    local label="local.$(id -un).arun.mirror"
+    local plist="$HOME/Library/LaunchAgents/$label.plist" uid; uid="$(id -u)"
+    command -v launchctl >/dev/null ||
+        die "arun mirror uses a macOS LaunchAgent; elsewhere run 'arun sync' from cron, e.g.  */10 * * * * $AR/arun sync"
+    case "${1:-status}" in
+    install)
+        echo ">>> checking that ssh works without a prompt (as the LaunchAgent will use it)"
+        local hosts h; hosts="$(for r in "$RUNS"/*/run.conf; do [ -e "$r" ] && (load "$(basename "$(dirname "$r")")"; echo "$HOST"); done 2>/dev/null | sort -u)"
+        [ -n "${hosts:-$DEFAULT_HOST}" ] || die "no HOST yet: set it in arun.conf (see arun.conf.example)"
+        for h in ${hosts:-$DEFAULT_HOST}; do
+            ssh -o BatchMode=yes -o ConnectTimeout=20 "$h" true 2>/dev/null || {
+                echo "ssh $h needs a password or a passphrase. Load your key into the agent once, e.g."
+                echo "    ssh-add --apple-use-keychain ~/.ssh/id_ed25519      (use your key file)"
+                echo "with 'UseKeychain yes' and 'AddKeysToAgent yes' under 'Host $h' in ~/.ssh/config, then retry."
+                exit 1; }
+        done
+        mkdir -p "$HOME/Library/LaunchAgents" "$VAR"
+        cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>                <string>$label</string>
+    <key>ProgramArguments</key>     <array><string>/bin/bash</string><string>$AR/arun</string><string>sync</string></array>
+    <key>StartInterval</key>        <integer>${SYNC_INTERVAL:-600}</integer>
+    <key>RunAtLoad</key>            <true/>
+    <key>ProcessType</key>          <string>Background</string>
+    <key>EnvironmentVariables</key> <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+    <key>StandardOutPath</key>      <string>$VAR/launchd.log</string>
+    <key>StandardErrorPath</key>    <string>$VAR/launchd.log</string>
+</dict>
+</plist>
+EOF
+        plutil -lint "$plist" >/dev/null
+        launchctl bootout "gui/$uid/$label" 2>/dev/null || true
+        launchctl bootstrap "gui/$uid" "$plist"
+        launchctl kickstart -k "gui/$uid/$label"
+        echo ">>> mirror installed ($plist, every ${SYNC_INTERVAL:-600} s); first sync running"
+        sleep 20
+        tail -n 5 "$VAR/sync.log" 2>/dev/null || echo "no sync result yet; see $VAR/launchd.log"
+        ;;
+    uninstall)
+        launchctl bootout "gui/$uid/$label" 2>/dev/null && echo "stopped $label" || echo "$label was not loaded"
+        rm -f "$plist"
+        ;;
+    status)
+        if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then echo "mirror: installed ($label)"; else echo "mirror: not installed (arun mirror install)"; fi
+        tail -n 5 "$VAR/sync.log" 2>/dev/null || true
+        ;;
+    *) die "usage: arun mirror install|uninstall|status" ;;
+    esac
+}
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+    new|launch|resume|rulings|stop|status|watch|fetch|sync|list|mirror) "cmd_$cmd" "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 64 ;;
+esac
