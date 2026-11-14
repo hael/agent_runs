@@ -124,10 +124,12 @@ def state_dir():
     return os.path.join(run_root(), 'state')
 
 
+# Text from git and diff is decoded as UTF-8 explicitly: the driver's locale may be ASCII (C/POSIX),
+# under which a hook that cannot decode its input would fail open.
 def git(*args, check=True, stdin=None):
     return subprocess.run(['git', '--no-optional-locks', '-C', repo_root()] + list(args),
                           check=check, input=stdin, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, universal_newlines=True).stdout
+                          stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='surrogateescape').stdout
 
 
 def plan_text():
@@ -333,7 +335,7 @@ def deny(msg):
 
 def hook():
     try:
-        data = json.load(sys.stdin)
+        data = json.loads(sys.stdin.buffer.read().decode('utf-8', 'surrogateescape'))
     except Exception as exc:  # fail open; the post-phase check still runs
         sys.stderr.write('arun fence: could not parse hook input (%s); allowing\n' % exc)
         sys.exit(0)
@@ -462,13 +464,13 @@ def check(phase):
 def unified(old, new, rel):
     res = subprocess.run(['diff', '-u', '--label', 'a/' + rel, '--label', 'b/' + rel,
                           old or '/dev/null', new or '/dev/null'],
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='surrogateescape')
     return res.stdout
 
 
 def phasediff(phase, out_path):
     changed, snap, mirror = changed_in_phase(phase)
-    with open(out_path, 'w') as out, tempfile.TemporaryDirectory() as tmp:
+    with open(out_path, 'w', encoding='utf-8', errors='surrogateescape') as out, tempfile.TemporaryDirectory() as tmp:
         for p in changed:
             if p in snap:
                 old = os.path.join(mirror, p) if snap[p] is not None else None
@@ -487,7 +489,7 @@ def phasediff(phase, out_path):
 
 
 def fulldiff(out_path):
-    with open(out_path, 'w') as out:
+    with open(out_path, 'w', encoding='utf-8', errors='surrogateescape') as out:
         out.write(git('diff', '--binary', 'HEAD'))
         for p in sorted(git('ls-files', '--others', '--exclude-standard').splitlines()):
             if not p:
@@ -495,7 +497,7 @@ def fulldiff(out_path):
             res = subprocess.run(['git', '--no-optional-locks', '-C', repo_root(), 'diff',
                                   '--no-index', '--binary', '/dev/null', p],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 universal_newlines=True)
+                                 universal_newlines=True, encoding='utf-8', errors='surrogateescape')
             out.write(res.stdout)
     print('full diff against HEAD in %s' % out_path)
 

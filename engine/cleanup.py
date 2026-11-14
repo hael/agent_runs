@@ -79,7 +79,7 @@ def is_cleanup_command(cmd):
 def guard():
     import json
     try:
-        data = json.load(sys.stdin)
+        data = json.loads(sys.stdin.buffer.read().decode('utf-8', 'surrogateescape'))
     except Exception:
         sys.exit(0)
     if data.get('tool_name') != 'Bash':
