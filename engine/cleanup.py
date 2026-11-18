@@ -139,9 +139,14 @@ def _darwin_processes(root):
             cwd = os.path.realpath(line[1:])
             if cwd == root or cwd.startswith(root + os.sep):
                 inside.add(pid)
+    # `caffeinate ... bash driver.sh` execs the driver in its own process and forks a child that holds
+    # the wake assertion until the driver ends: that child belongs to the driver, it is not a job
+    keep_awake = os.path.join(root, 'engine', 'driver.sh')
     found = []
-    for pid, (_, cmd) in sorted(procs.items()):
+    for pid, (ppid, cmd) in sorted(procs.items()):
         if pid in mine or cmd.startswith('ps ') or cmd.startswith('lsof '):
+            continue
+        if cmd.startswith('caffeinate ') and cmd.endswith(keep_awake) and ppid in mine:
             continue
         try:
             in_session = sid is not None and os.getsid(pid) == sid
