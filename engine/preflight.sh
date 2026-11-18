@@ -17,13 +17,16 @@ ROOT="$_ROOT"; ENGINE="$ROOT/engine"; SPEC="$ROOT/spec"; REPO="$ROOT/repo"; LOGS
 unset LOCAL_REPO
 PHASES="${PHASES:-0 1 2 3 4 5 6 7 8 9 10}"
 FIRST="${PHASES%% *}"
+# macOS: GNU timeout, util-linux flock and setsid, nproc as small shims (engine/compat)
+[ "$(uname -s)" = Darwin ] && export PATH="$ENGINE/compat:$PATH"
 mkdir -p "$LOGS" "$STATE" "$ROOT/scratch" "$ROOT/review"
 REPORT="$LOGS/preflight.txt"
 : > "$REPORT"
 say() { echo "$*" | tee -a "$REPORT"; }
 
 say "== machine"
-{ uname -a; grep -E '^(NAME|VERSION)=' /etc/os-release 2>/dev/null; echo "nproc $(nproc)"; uptime
+{ uname -a; grep -E '^(NAME|VERSION)=' /etc/os-release 2>/dev/null; sw_vers 2>/dev/null; echo "nproc $(nproc)"; uptime
+  sysctl -n hw.memsize 2>/dev/null | awk '{printf "memory %.0f GB\n", $1/2^30}'
   free -g 2>/dev/null | head -n 2; df -h "$ROOT" | tail -n 1; } >> "$REPORT" 2>&1
 say "== tools"
 # shellcheck disable=SC2086
@@ -45,7 +48,7 @@ for t in git python3 rsync flock timeout setsid; do
 done
 [ -d "$REPO/.git" ] || { say "no repository at $REPO"; exit 2; }
 
-CLAUDE="$(command -v claude || echo "$HOME/.local/bin/claude")"
+CLAUDE="${CLAUDE_BIN:-$(command -v claude || echo "$HOME/.local/bin/claude")}"   # as driver.sh
 if [ ! -x "$CLAUDE" ]; then
     say "== installing Claude Code (native installer)"
     curl -fsSL https://claude.ai/install.sh | bash >> "$REPORT" 2>&1 || true

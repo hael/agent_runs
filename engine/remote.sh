@@ -17,9 +17,23 @@ CMD="${2:?command}"
 shift 2
 DRIVER="$ROOT/engine/driver.sh"
 
+DARWIN=0; [ "$(uname -s)" = Darwin ] && DARWIN=1
+# macOS: GNU timeout, util-linux setsid, nproc as small shims (engine/compat)
+[ "$DARWIN" = 1 ] && export PATH="$ROOT/engine/compat:$PATH"
+
 driver_pid() {
     # the driver's own bash (not its subshells: those have the driver as parent)
     local p cmd
+    if [ "$DARWIN" = 1 ]; then          # no /proc: the command lines from ps
+        for p in $(pgrep -u "$USER" -f '^bash (.*/)?engine/driver\.sh$' 2>/dev/null); do
+            cmd="$(ps -o command= -p "$p" 2>/dev/null)"
+            [ "$cmd" = "bash $DRIVER" ] || continue
+            [ "$(ps -o command= -p "$(ps -o ppid= -p "$p" | tr -d ' ')" 2>/dev/null)" = "$cmd" ] && continue
+            echo "$p"
+            return
+        done
+        return
+    fi
     for p in $(pgrep -u "$USER" -f '^bash (.*/)?engine/driver\.sh$' 2>/dev/null); do
         cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
         [ "$cmd" = "bash $DRIVER " ] || continue
@@ -37,7 +51,9 @@ run_pids() {
     # process tree is added for anything that cleared its environment.
     local p tree="${1:-}" kids
     {
-        for p in $(pgrep -u "$USER" 2>/dev/null); do
+        # macOS: the driver's session and every process working inside the run directory
+        [ "$DARWIN" = 1 ] && ARUN_ROOT="$ROOT" python3 "$ROOT/engine/cleanup.py" pids 2>/dev/null | cut -d' ' -f1
+        [ "$DARWIN" = 1 ] || for p in $(pgrep -u "$USER" 2>/dev/null); do
             [ "$p" = "$$" ] && continue
             tr '\0' '\n' 2>/dev/null < "/proc/$p/environ" | grep -qx "ARUN_ROOT=$ROOT" && echo "$p"
         done
@@ -92,15 +108,22 @@ status)
     git -C "$ROOT/repo" --no-optional-locks diff --stat HEAD 2>/dev/null | tail -n 1
     echo "new files: $(git -C "$ROOT/repo" --no-optional-locks ls-files --others --exclude-standard 2>/dev/null | wc -l)"
     echo
-    echo "== machine: load $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cores, $(free -g 2>/dev/null | awk '/^Mem:/ {print $3 "/" $2 " GB used"}')"
+    if [ "$DARWIN" = 1 ]; then
+        echo "== machine: load $(sysctl -n vm.loadavg | tr -d '{}' | awk '{print $1, $2, $3}') on $(sysctl -n hw.ncpu) cores, $(sysctl -n hw.memsize | awk '{printf "%.0f GB", $1/2^30}') memory"
+    else
+        echo "== machine: load $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cores, $(free -g 2>/dev/null | awk '/^Mem:/ {print $3 "/" $2 " GB used"}')"
+    fi
     echo "== jobs of the run (top by CPU)"
     jp="$(conf JOB_PATTERN 'make|cmake|ctest')"
-    ps -u "$USER" -o pid,etime,pcpu,rss,args --sort=-pcpu 2>/dev/null |
-        grep -E "$jp" | grep -v -e grep -e claude | cut -c1-170 | head -n 10
+    if [ "$DARWIN" = 1 ]; then
+        ps -u "$USER" -r -o pid,etime,pcpu,rss,command 2>/dev/null
+    else
+        ps -u "$USER" -o pid,etime,pcpu,rss,args --sort=-pcpu 2>/dev/null
+    fi | grep -E "$jp" | grep -v -e grep -e claude | cut -c1-170 | head -n 10
     echo
     echo "== disk: $(df -h "$ROOT" | awk 'NR==2 {print $4 " free of " $2 " on " $6 " (" $1 ")"}')"
-    # one pass over the run directory, three levels deep (sizes in kB)
-    du -k --max-depth=3 "$ROOT" 2>/dev/null | awk -v r="$ROOT" -v now="$(date +%s)" '
+    # one pass over the run directory, three levels deep (sizes in kB; -d is GNU and BSD du)
+    du -k -d 3 "$ROOT" 2>/dev/null | awk -v r="$ROOT" -v now="$(date +%s)" '
         function h(k) { return k >= 1048576 ? sprintf("%.1fG", k/1048576) : (k >= 1024 ? sprintf("%.0fM", k/1024) : k "K") }
         $2 == r { total = $1; next }
         index($2, r "/") == 1 { p = substr($2, length(r) + 2); d = gsub("/", "/", p)
@@ -175,7 +198,12 @@ start)
     cd "$ROOT" || exit 1
     mkdir -p logs
     before="$(cat logs/driver.log 2>/dev/null | wc -l)"
-    nohup setsid bash "$DRIVER" >> logs/driver.out 2>&1 < /dev/null &
+    if [ "$DARWIN" = 1 ]; then
+        # caffeinate keeps the Mac from sleeping (idle and, on AC power, system sleep) while the driver runs
+        nohup setsid caffeinate -i -s bash "$DRIVER" >> logs/driver.out 2>&1 < /dev/null &
+    else
+        nohup setsid bash "$DRIVER" >> logs/driver.out 2>&1 < /dev/null &
+    fi
     sleep 8
     if [ -n "$(driver_pid)" ]; then
         echo "driver running (pid $(driver_pid)); last lines of its log:"

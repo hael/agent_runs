@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""util-linux setsid(1) for macOS: run COMMAND in a new session. As setsid(1) without -w, a
+process group leader forks first and the parent returns at once."""
+import os
+import sys
+
+args = sys.argv[1:]
+while args and args[0] in ('-f', '--fork', '-w', '--wait', '-c', '--ctty'):
+    args.pop(0)
+if not args:
+    sys.stderr.write('setsid: usage: setsid COMMAND [ARG...]\n')
+    sys.exit(64)
+if os.getpgrp() == os.getpid() and os.fork() > 0:
+    os._exit(0)
+os.setsid()
+try:
+    os.execvp(args[0], args)
+except OSError as e:
+    sys.stderr.write('setsid: failed to execute %s: %s\n' % (args[0], e.strerror))
+    sys.exit(127 if isinstance(e, FileNotFoundError) else 126)

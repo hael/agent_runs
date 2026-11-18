@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""GNU timeout(1) for macOS, the subset arun and its sessions use:
+   timeout [-s SIG|--signal=SIG] [-k DUR|--kill-after=DUR] [--foreground] [--preserve-status] DUR CMD [ARG...]
+DUR takes s, m, h, d suffixes. Unless --foreground, timeout leads its own process group and
+signals the whole group on expiry, as GNU timeout does. Exit 124 on timeout, 125 on usage errors,
+126/127 when CMD cannot run."""
+import os
+import signal
+import subprocess
+import sys
+import time
+
+
+def die(msg, rc=125):
+    sys.stderr.write('timeout: %s\n' % msg)
+    sys.exit(rc)
+
+
+def duration(s):
+    mult = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+    try:
+        return float(s[:-1]) * mult[s[-1]] if s and s[-1] in mult else float(s)
+    except ValueError:
+        die('invalid time interval %r' % s)
+
+
+def signum(s):
+    s = s.upper()
+    if s.isdigit():
+        return int(s)
+    name = s if s.startswith('SIG') else 'SIG' + s
+    if not hasattr(signal, name):
+        die('invalid signal %r' % s)
+    return getattr(signal, name)
+
+
+args = sys.argv[1:]
+sig, kill_after, foreground, preserve = signal.SIGTERM, None, False, False
+while args and args[0].startswith('-') and args[0] != '-':
+    a = args.pop(0)
+    if a == '--':
+        break
+    elif a.startswith('--signal='):
+        sig = signum(a.split('=', 1)[1])
+    elif a in ('-s', '--signal'):
+        sig = signum(args.pop(0)) if args else die('missing signal')
+    elif a.startswith('-s'):
+        sig = signum(a[2:])
+    elif a.startswith('--kill-after='):
+        kill_after = duration(a.split('=', 1)[1])
+    elif a in ('-k', '--kill-after'):
+        kill_after = duration(args.pop(0)) if args else die('missing duration')
+    elif a.startswith('-k'):
+        kill_after = duration(a[2:])
+    elif a == '--foreground':
+        foreground = True
+    elif a == '--preserve-status':
+        preserve = True
+    elif a in ('-v', '--verbose'):
+        pass
+    else:
+        die('unknown option %s' % a)
+if len(args) < 2:
+    die('usage: timeout [options] DURATION COMMAND [ARG]...')
+limit = duration(args[0])
+cmd = args[1:]
+
+if not foreground:
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass                      # already a group or session leader: signal the group we lead
+try:
+    child = subprocess.Popen(cmd)
+except FileNotFoundError:
+    die('failed to run command %r: No such file or directory' % cmd[0], 127)
+except PermissionError:
+    die('failed to run command %r: Permission denied' % cmd[0], 126)
+
+
+def send(s):
+    if foreground or os.getpgrp() != os.getpid():
+        try:
+            child.send_signal(s)
+        except OSError:
+            pass
+    else:
+        old = signal.signal(s, signal.SIG_IGN) if s not in (signal.SIGKILL, signal.SIGSTOP) else None
+        try:
+            os.killpg(0, s)
+        except OSError:
+            pass
+        if old is not None:
+            signal.signal(s, old)
+
+
+def forward(s, _frame):
+    send(s)
+
+
+for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+    signal.signal(s, forward)
+
+timed_out = False
+try:
+    rc = child.wait(timeout=limit if limit > 0 else None)
+except subprocess.TimeoutExpired:
+    timed_out = True
+    send(sig)
+    try:
+        rc = child.wait(timeout=kill_after) if kill_after else child.wait()
+    except subprocess.TimeoutExpired:
+        send(signal.SIGKILL)
+        rc = child.wait()
+if rc < 0:
+    rc = 128 - rc
+if timed_out and not preserve:
+    sys.exit(124)
+sys.exit(rc)

@@ -14,6 +14,7 @@ Two parts, both automatic:
                            of the run is still alive. The list goes to
                            logs/cleanup_phase_N.txt.
   cleanup.py report        Free space and the largest folders of scratch/ (debugging).
+  cleanup.py pids          The run's live processes, "pid command" per line (remote.sh on macOS).
 
 Configuration (spec/run.conf): DISK_MIN_GB (20), CLEANUP (1; 0 turns the sweep off),
 CLEAN_MIN_MB (1).
@@ -103,9 +104,59 @@ def guard():
     sys.exit(2)
 
 
+def _darwin_processes(root):
+    """macOS has no /proc and ps shows no environment: a process belongs to the run when it is in
+    the driver's session (state/driver.sid, written by driver.sh) or its working directory lies
+    inside the run directory (a job that left the session)."""
+    import subprocess
+    user = os.environ.get('USER') or str(os.getuid())
+    ps = subprocess.run(['ps', '-u', user, '-o', 'pid=,ppid=,tty=,command='], stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, universal_newlines=True).stdout
+    procs, tty = {}, set()
+    for line in ps.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[3] if len(parts) > 3 else '')
+            if parts[2] != '??':
+                tty.add(int(parts[0]))      # a terminal of the user's, even when it sits in the run directory
+    mine, p = set(), os.getpid()
+    while p > 1 and p not in mine:
+        mine.add(p)
+        p = procs.get(p, (1, ''))[0]
+    try:
+        with open(os.path.join(root, 'state', 'driver.sid')) as fh:
+            sid = int(fh.read().split()[0])
+    except Exception:
+        sid = None
+    inside = set()
+    lsof = subprocess.run(['lsof', '-a', '-d', 'cwd', '-u', user, '-Fpn'], stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, universal_newlines=True).stdout
+    pid = None
+    for line in lsof.splitlines():
+        if line.startswith('p'):
+            pid = int(line[1:])
+        elif line.startswith('n') and pid is not None:
+            cwd = os.path.realpath(line[1:])
+            if cwd == root or cwd.startswith(root + os.sep):
+                inside.add(pid)
+    found = []
+    for pid, (_, cmd) in sorted(procs.items()):
+        if pid in mine or cmd.startswith('ps ') or cmd.startswith('lsof '):
+            continue
+        try:
+            in_session = sid is not None and os.getsid(pid) == sid
+        except OSError:
+            continue
+        if in_session or (pid in inside and pid not in tty):
+            found.append('%d %s' % (pid, cmd[:120]))
+    return found
+
+
 def run_processes():
     """Processes of the run other than this one and its ancestors (the driver)."""
     root = run_root()
+    if not os.path.isdir('/proc'):
+        return _darwin_processes(root)
     marks = {('ARUN_ROOT=' + root).encode()}
     mine, p = set(), os.getpid()
     while p > 1:
@@ -210,6 +261,9 @@ def main(argv):
         sweep(int(argv[2]))
     elif mode == 'report':
         report()
+    elif mode == 'pids':                 # remote.sh: the run's processes, "pid command" per line
+        for line in run_processes():
+            print(line)
     else:
         sys.stderr.write(__doc__)
         sys.exit(64)

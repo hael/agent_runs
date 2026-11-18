@@ -41,6 +41,8 @@ LIMIT_SLEEP="${LIMIT_SLEEP:-1800}"
 RETRY_SLEEP="${RETRY_SLEEP:-60}"
 CONTINUE_SESSION="${CONTINUE_SESSION:-1}"
 FAST_MODE="${FAST_MODE:-1}"
+# macOS: GNU timeout, util-linux flock and setsid, nproc as small shims (engine/compat), also for the sessions
+[ "$(uname -s)" = Darwin ] && export PATH="$ENGINE/compat:$PATH"
 CLAUDE="${CLAUDE_BIN:-$(command -v claude || echo "$HOME/.local/bin/claude")}"
 export ARUN_ROOT="$ROOT" ARUN_REPO="$REPO"
 
@@ -50,6 +52,8 @@ if ! flock -n 9; then
     echo "another driver holds $STATE/driver.lock" >&2
     exit 1
 fi
+# the driver's session: on macOS (no /proc environ) it is how remote.sh and cleanup.py find the run's processes
+python3 -c 'import os; print(os.getsid(0))' > "$STATE/driver.sid" 2>/dev/null
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOGS/driver.log"; }
 fence() { python3 "$ENGINE/fence.py" "$@"; }

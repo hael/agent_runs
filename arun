@@ -48,20 +48,45 @@ load() {
     LOCAL_REPO="${LOCAL_REPO/#\~/$HOME}"
 }
 
+# HOST=local: the run lives on this machine. arun then runs the remote side here, in the home
+# directory and in a clean environment like an ssh login's (nothing of the calling shell, such as a
+# Claude Code session's variables, reaches the run), with LOCAL_PATH as PATH.
+LOCAL_PATH_DEFAULT="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+is_local() { [ "$HOST" = local ]; }
+
+# on_host <command string>: run it on the run's machine, in the home directory
+on_host() {
+    if is_local; then
+        ( cd "$HOME" && exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" SHELL=/bin/bash \
+            TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-en_US.UTF-8}" PATH="${LOCAL_PATH:-$LOCAL_PATH_DEFAULT}" \
+            /bin/bash -c "$1" )
+    else
+        ssh "${SSH_OPTS[@]}" "$HOST" "$1"
+    fi
+}
+
 # remote <command> [args]: engine/remote.sh on the remote machine, for this run
 remote() {
-    ssh "${SSH_OPTS[@]}" "$HOST" "bash -s -- '$REMOTE_ROOT' $*" < "$ENGINE/remote.sh"
+    on_host "bash -s -- '$REMOTE_ROOT' $*" < "$ENGINE/remote.sh"
 }
 
 copy_to() {
-    # copy_to <local dir>/ <remote dir>/ [rsync options...]
+    # copy_to <local dir>/ <remote dir, relative to its home>/ [rsync options...]
     local src="$1" dst="$2"; shift 2
-    rsync -a -e "ssh ${SSH_OPTS[*]}" "$@" "$src" "$HOST:$dst"
+    if is_local; then rsync -a "$@" "$src" "$HOME/$dst"
+    else rsync -a -e "ssh ${SSH_OPTS[*]}" "$@" "$src" "$HOST:$dst"; fi
+}
+
+copy_from() {
+    # copy_from <remote path, relative to its home> <local path> [rsync options...]
+    local src="$1" dst="$2"; shift 2
+    if is_local; then rsync -a "$@" "$HOME/$src" "$dst"
+    else rsync -a -e "ssh ${SSH_OPTS[*]}" "$@" "$HOST:$src" "$dst"; fi
 }
 
 push() {
     # the engine and the run's spec (prompt, phase notes, rulings) to the remote run
-    ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p '$REMOTE_ROOT/engine' '$REMOTE_ROOT/spec'"
+    on_host "mkdir -p '$REMOTE_ROOT/engine' '$REMOTE_ROOT/spec'"
     copy_to "$ENGINE/" "$REMOTE_ROOT/engine/" --delete --exclude '.DS_Store' --exclude '__pycache__'
     local tmp; tmp="$(mktemp -d)"
     for f in "${SPEC_FILES[@]}"; do
@@ -87,9 +112,8 @@ copy_repo() {
     local -a pats=() ex=(); local p
     read -r -a pats <<< "${COPY_EXCLUDES:-/build/ node_modules/}"
     for p in "${pats[@]}"; do ex+=(--exclude "$p"); done
-    ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p '$REMOTE_ROOT/repo'"
-    rsync -a -e "ssh ${SSH_OPTS[*]}" "${ex[@]}" --exclude '.DS_Store' \
-        --exclude-from="$untracked" "$LOCAL_REPO/" "$HOST:$REMOTE_ROOT/repo/"
+    on_host "mkdir -p '$REMOTE_ROOT/repo'"
+    copy_to "$LOCAL_REPO/" "$REMOTE_ROOT/repo/" "${ex[@]}" --exclude '.DS_Store' --exclude-from="$untracked"
     rm -f "$untracked"
 }
 
@@ -100,7 +124,7 @@ mirror_now() {
 }
 
 session_view() {
-    ssh "${SSH_OPTS[@]}" "$HOST" "env ARUN_ROOT=\$HOME/$REMOTE_ROOT python3 - $*" < "$ENGINE/session_view.py"
+    on_host "env ARUN_ROOT=\$HOME/$REMOTE_ROOT python3 - $*" < "$ENGINE/session_view.py"
 }
 
 cmd_new() {
@@ -116,13 +140,13 @@ cmd_new() {
 
 cmd_launch() {
     load "$1"
-    echo ">>> ssh $HOST"
-    ssh "${SSH_OPTS[@]}" "$HOST" true
+    echo ">>> host $HOST"
+    on_host true
     if remote running; then die "the run is already running on $HOST"; fi
-    if ssh "${SSH_OPTS[@]}" "$HOST" "test -e '$REMOTE_ROOT/state/base_head'"; then
+    if on_host "test -e '$REMOTE_ROOT/state/base_head'"; then
         die "$HOST:~/$REMOTE_ROOT was launched before; continue it with: arun resume $RUN"
     fi
-    if ssh "${SSH_OPTS[@]}" "$HOST" "test -d '$REMOTE_ROOT/repo/.git'"; then
+    if on_host "test -d '$REMOTE_ROOT/repo/.git'"; then
         echo ">>> $HOST:~/$REMOTE_ROOT/repo exists; keeping it (remove the run directory to start over)"
     else
         copy_repo
@@ -130,7 +154,7 @@ cmd_launch() {
     echo ">>> engine and spec"
     push
     echo ">>> preflight on $HOST (a few minutes)"
-    ssh "${SSH_OPTS[@]}" "$HOST" "bash '$REMOTE_ROOT/engine/preflight.sh'"
+    on_host "bash '$REMOTE_ROOT/engine/preflight.sh'"
     echo ">>> starting"
     remote start
     mirror_now
@@ -159,7 +183,7 @@ cmd_rulings() {
     # phase and on resume
     load "$1"
     [ -f "$RDIR/rulings.md" ] || die "runs/$RUN/rulings.md is missing"
-    ssh "${SSH_OPTS[@]}" "$HOST" "cd '$REMOTE_ROOT' && mkdir -p spec && cat > spec/.rulings.tmp && mv spec/.rulings.tmp spec/rulings.md &&
+    on_host "cd '$REMOTE_ROOT' && mkdir -p spec && cat > spec/.rulings.tmp && mv spec/.rulings.tmp spec/rulings.md &&
         echo 'sent to $HOST:~/$REMOTE_ROOT/spec/rulings.md'" < "$RDIR/rulings.md"
     if remote running; then
         echo "the run is running: the session reads them when the next phase starts (or on arun resume after a stop)"
@@ -183,7 +207,7 @@ cmd_fetch() {
     load "$1"
     local out="$RDIR/result"
     mkdir -p "$out"
-    copy_to_local() { rsync -a -e "ssh ${SSH_OPTS[*]}" "$HOST:$REMOTE_ROOT/$1" "$2" 2>/dev/null || true; }
+    copy_to_local() { copy_from "$REMOTE_ROOT/$1" "$2" 2>/dev/null || true; }
     copy_to_local review "$out/"
     for f in RUN_STATUS.md state/base_head; do copy_to_local "$f" "$out/"; done
     local report="${PLAN_DONE:-${PLAN:-doc/$RUN}}"; report="${report%.md}_report.md"
@@ -217,9 +241,9 @@ sync_run() {
         else
             ok=0
         fi
-        if ssh "${SSH_OPTS[@]}" "$HOST" "test -d '$REMOTE_ROOT/review'" 2>> "$err"; then
+        if on_host "test -d '$REMOTE_ROOT/review'" 2>> "$err"; then
             mkdir -p "$live/remote/review"
-            rsync -a --delete -e "ssh ${SSH_OPTS[*]}" "$HOST:$REMOTE_ROOT/review/" "$live/remote/review/" 2>> "$err" || ok=0
+            copy_from "$REMOTE_ROOT/review/" "$live/remote/review/" --delete 2>> "$err" || ok=0
         fi
     else
         ok=0
@@ -292,6 +316,7 @@ cmd_mirror() {
         local hosts h; hosts="$(for r in "$RUNS"/*/run.conf; do [ -e "$r" ] && (load "$(basename "$(dirname "$r")")"; echo "$HOST"); done 2>/dev/null | sort -u)"
         [ -n "${hosts:-$DEFAULT_HOST}" ] || die "no HOST yet: set it in arun.conf (see arun.conf.example)"
         for h in ${hosts:-$DEFAULT_HOST}; do
+            [ "$h" = local ] && continue        # a run on this machine needs no ssh
             ssh -o BatchMode=yes -o ConnectTimeout=20 "$h" true 2>/dev/null || {
                 echo "ssh $h needs a password or a passphrase. Load your key into the agent once, e.g."
                 echo "    ssh-add --apple-use-keychain ~/.ssh/id_ed25519      (use your key file)"

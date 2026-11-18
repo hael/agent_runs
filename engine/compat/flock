@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""util-linux flock(1) for macOS, the subset arun and its sessions use:
+   flock [-n] [-s|-x] [-u] [-w SECS] FD
+   flock [-n] [-s|-x] [-w SECS] [-E CODE] FILE|DIR [-c COMMAND | COMMAND [ARG...]]
+On an inherited FD the lock stays with the caller's open file, as with flock(1). Exit 1 when
+-n or -w cannot get the lock (or -E CODE)."""
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+args = sys.argv[1:]
+nb, shared, unlock, wait, conflict = False, False, False, None, 1
+while args and args[0].startswith('-'):
+    a = args.pop(0)
+    if a == '--':
+        break
+    if a in ('-n', '--nb', '--nonblock'):
+        nb = True
+    elif a in ('-s', '--shared'):
+        shared = True
+    elif a in ('-x', '-e', '--exclusive'):
+        shared = False
+    elif a in ('-u', '--unlock'):
+        unlock = True
+    elif a in ('-w', '--wait', '--timeout'):
+        wait = float(args.pop(0))
+    elif a in ('-E', '--conflict-exit-code'):
+        conflict = int(args.pop(0))
+    elif a in ('-o', '--close'):
+        pass
+    elif a == '-c':
+        args.insert(0, '-c')
+        break
+    else:
+        sys.stderr.write('flock: unknown option %s\n' % a)
+        sys.exit(64)
+if not args:
+    sys.stderr.write('flock: usage: flock [options] FD | flock [options] FILE COMMAND\n')
+    sys.exit(64)
+
+
+def lock(fd):
+    op = fcntl.LOCK_UN if unlock else (fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+    if unlock:
+        fcntl.flock(fd, op)
+        return True
+    if nb or wait is not None:
+        end = time.time() + (wait or 0)
+        while True:
+            try:
+                fcntl.flock(fd, op | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                if time.time() >= end:
+                    return False
+                time.sleep(0.1)
+    fcntl.flock(fd, op)
+    return True
+
+
+target = args.pop(0)
+if target.isdigit() and not args:
+    sys.exit(0 if lock(int(target)) else conflict)
+if target == '-c':
+    sys.stderr.write('flock: a file is needed before -c\n')
+    sys.exit(64)
+fd = os.open(target, os.O_RDONLY if os.path.isdir(target) else os.O_RDWR | os.O_CREAT, 0o644)
+if not lock(fd):
+    sys.exit(conflict)
+if not args:
+    sys.exit(0)
+cmd = ['/bin/sh', '-c', args[1]] if args[0] == '-c' and len(args) > 1 else args
+sys.exit(subprocess.call(cmd, pass_fds=()))
